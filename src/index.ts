@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Buffer } from "node:buffer";
+import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -302,11 +303,21 @@ export async function runServer(): Promise<void> {
   console.error("jira-labels-mcp running on stdio");
 }
 
-const isDirectExecution =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href;
+function isDirectExecution(): boolean {
+  const entryPath = process.argv[1];
 
-if (isDirectExecution) {
+  if (!entryPath) {
+    return false;
+  }
+
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entryPath)).href;
+  } catch {
+    return import.meta.url === pathToFileURL(entryPath).href;
+  }
+}
+
+if (isDirectExecution()) {
   runServer().catch((error: unknown) => {
     const message = error instanceof Error ? error.stack ?? error.message : String(error);
     console.error(message);
