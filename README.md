@@ -1,9 +1,11 @@
 # mcp-jira-labels
 
-Tiny MCP server for exactly two Jira operations:
+Tiny MCP server for a few focused Jira operations:
 
 - add a label to an issue
 - remove a label from an issue
+- fetch attachments from an issue as embedded resources
+- fetch image attachments from an issue as inline images
 
 It uses Jira token-style credentials over the REST API with Basic auth. No OAuth.
 
@@ -47,13 +49,30 @@ npm run build
 
 - `jira_add_label`
 - `jira_remove_label`
+- `jira_download_attachments`
+- `jira_get_issue_images`
 
-Each tool takes:
+Label tools take:
 
 - `issueKey` — like `PROJ-123`
 - `label` — the label to add or remove
 
 The server returns whether anything changed and the current label list after the operation.
+
+Attachment tools take:
+
+- `issueKey` — like `PROJ-123`
+
+`jira_download_attachments` returns a text summary plus one embedded MCP resource per attachment, with the file contents base64-encoded for client-side inspection.
+
+`jira_get_issue_images` returns a text summary plus one inline MCP image block per image attachment so vision-capable agents can inspect screenshots and other image files directly.
+
+Notes for attachments:
+
+- files over 50 MB are skipped instead of being inlined, based on both Jira metadata and the actual downloaded payload size
+- image detection falls back to the filename extension when Jira reports an ambiguous MIME type
+- non-image attachments are excluded from `jira_get_issue_images`
+- Basic auth is only attached when the attachment download URL is on the same origin as `JIRA_BASE_URL`
 
 ## Claude Desktop example
 

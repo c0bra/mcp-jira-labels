@@ -2,6 +2,7 @@
 
 import { Buffer } from "node:buffer";
 import { realpathSync } from "node:fs";
+import { extname } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -34,8 +35,46 @@ const labelOutputSchema = z.object({
   message: z.string(),
 });
 
+const attachmentFailureSchema = z.object({
+  filename: z.string(),
+  error: z.string(),
+});
+
+const attachmentMetadataSchema = z.object({
+  id: z.string(),
+  filename: z.string(),
+  mimeType: z.string(),
+  size: z.number().int().nonnegative(),
+});
+
+const attachmentInputSchema = z.object({
+  issueKey: issueKeySchema,
+});
+
+const downloadAttachmentsOutputSchema = z.object({
+  issueKey: z.string(),
+  total: z.number().int().nonnegative(),
+  downloaded: z.number().int().nonnegative(),
+  attachments: z.array(attachmentMetadataSchema),
+  failed: z.array(attachmentFailureSchema),
+  message: z.string().optional(),
+});
+
+const issueImagesOutputSchema = z.object({
+  issueKey: z.string(),
+  totalImages: z.number().int().nonnegative(),
+  downloaded: z.number().int().nonnegative(),
+  images: z.array(attachmentMetadataSchema),
+  failed: z.array(attachmentFailureSchema),
+  message: z.string().optional(),
+});
+
 type LabelAction = z.infer<typeof labelOutputSchema>["action"];
 type LabelResult = z.infer<typeof labelOutputSchema>;
+type AttachmentFailure = z.infer<typeof attachmentFailureSchema>;
+type AttachmentMetadata = z.infer<typeof attachmentMetadataSchema>;
+type DownloadAttachmentsResult = z.infer<typeof downloadAttachmentsOutputSchema>;
+type IssueImagesResult = z.infer<typeof issueImagesOutputSchema>;
 
 type JiraConfig = {
   apiVersion: string;
@@ -49,6 +88,69 @@ type JiraIssueResponse = {
     labels?: string[];
   };
 };
+
+type JiraAttachmentResponse = {
+  content?: string;
+  filename?: string;
+  id?: string;
+  mimeType?: string;
+  size?: number;
+};
+
+type JiraIssueAttachmentsResponse = {
+  fields?: {
+    attachment?: JiraAttachmentResponse[];
+  };
+};
+
+type JiraAttachment = {
+  contentUrl?: string;
+  filename: string;
+  id: string;
+  mimeType?: string;
+  size: number;
+};
+
+type AttachmentBinary = {
+  data: Buffer;
+  mimeType: string;
+};
+
+const ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
+
+const IMAGE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/svg+xml",
+  "image/bmp",
+]);
+
+const AMBIGUOUS_MIME_TYPES = new Set([
+  "application/octet-stream",
+  "application/binary",
+]);
+
+const IMAGE_EXTENSION_TO_MIME_TYPE = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".svg", "image/svg+xml"],
+  [".bmp", "image/bmp"],
+]);
+
+const ATTACHMENT_EXTENSION_TO_MIME_TYPE = new Map([
+  ...IMAGE_EXTENSION_TO_MIME_TYPE.entries(),
+  [".pdf", "application/pdf"],
+  [".txt", "text/plain"],
+  [".json", "application/json"],
+  [".csv", "text/csv"],
+  [".log", "text/plain"],
+  [".zip", "application/zip"],
+]);
 
 class JiraRequestError extends Error {
   constructor(
@@ -136,6 +238,14 @@ async function jiraRequest<T>(
     return (await response.json()) as T;
   }
 
+  throw new JiraRequestError(
+    `Jira request failed with status ${response.status}.`,
+    response.status,
+    await getResponseDetails(response),
+  );
+}
+
+async function getResponseDetails(response: Response): Promise<string | undefined> {
   const responseText = await response.text();
   let details = responseText.trim();
 
@@ -159,11 +269,7 @@ async function jiraRequest<T>(
     details = responseText.trim();
   }
 
-  throw new JiraRequestError(
-    `Jira request failed with status ${response.status}.`,
-    response.status,
-    details || undefined,
-  );
+  return details || undefined;
 }
 
 async function getIssueLabels(
@@ -178,6 +284,163 @@ async function getIssueLabels(
   });
 
   return issue?.fields?.labels ?? [];
+}
+
+function normalizeAttachment(issueKey: string, attachment: JiraAttachmentResponse): JiraAttachment {
+  if (!attachment.id) {
+    throw new JiraRequestError(`Attachment on ${issueKey} is missing an id.`);
+  }
+
+  if (!attachment.filename) {
+    throw new JiraRequestError(
+      `Attachment ${attachment.id} on ${issueKey} is missing a filename.`,
+    );
+  }
+
+  return {
+    contentUrl: attachment.content,
+    filename: attachment.filename,
+    id: attachment.id,
+    mimeType: attachment.mimeType,
+    size: attachment.size ?? 0,
+  };
+}
+
+function getMimeTypeFromFilename(filename: string): string | undefined {
+  return ATTACHMENT_EXTENSION_TO_MIME_TYPE.get(extname(filename).toLowerCase());
+}
+
+function normalizeMimeType(mimeType: string | undefined): string | undefined {
+  return mimeType?.split(";", 1)[0]?.trim().toLowerCase() || undefined;
+}
+
+function shouldSendAuthHeader(config: JiraConfig, contentUrl: string): boolean {
+  try {
+    return new URL(contentUrl).origin === new URL(config.baseUrl).origin;
+  } catch {
+    return false;
+  }
+}
+
+function resolveAttachmentMimeType(
+  mimeType: string | undefined,
+  filename: string,
+): string {
+  return normalizeMimeType(mimeType) || getMimeTypeFromFilename(filename) || "application/octet-stream";
+}
+
+function resolveImageMimeType(
+  mimeType: string | undefined,
+  filename: string,
+): string | undefined {
+  const normalizedMimeType = normalizeMimeType(mimeType);
+  if (normalizedMimeType && IMAGE_MIME_TYPES.has(normalizedMimeType)) {
+    return normalizedMimeType;
+  }
+
+  if (
+    !normalizedMimeType ||
+    AMBIGUOUS_MIME_TYPES.has(normalizedMimeType)
+  ) {
+    const extensionMimeType = IMAGE_EXTENSION_TO_MIME_TYPE.get(
+      extname(filename).toLowerCase(),
+    );
+    if (extensionMimeType) {
+      return extensionMimeType;
+    }
+  }
+
+  return undefined;
+}
+
+async function getIssueAttachments(
+  config: JiraConfig,
+  issueKey: string,
+): Promise<JiraAttachment[]> {
+  const url = buildIssueUrl(config, issueKey);
+  url.searchParams.set("fields", "attachment");
+
+  const issue = await jiraRequest<JiraIssueAttachmentsResponse>(config, url, {
+    method: "GET",
+  });
+
+  return (issue?.fields?.attachment ?? []).map((attachment) =>
+    normalizeAttachment(issueKey, attachment),
+  );
+}
+
+async function fetchAttachmentBinary(
+  config: JiraConfig,
+  issueKey: string,
+  attachment: JiraAttachment,
+): Promise<AttachmentBinary> {
+  if (!attachment.contentUrl) {
+    throw new JiraRequestError(
+      `Attachment ${attachment.filename} on ${issueKey} has no content URL.`,
+    );
+  }
+
+  const headers: HeadersInit = {
+    Accept: "*/*",
+  };
+  if (shouldSendAuthHeader(config, attachment.contentUrl)) {
+    headers.Authorization = getAuthHeader(config);
+  }
+
+  const response = await fetch(attachment.contentUrl, {
+    headers,
+  });
+
+  if (!response.ok) {
+    throw new JiraRequestError(
+      `Attachment download failed with status ${response.status}.`,
+      response.status,
+      await getResponseDetails(response),
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  if (arrayBuffer.byteLength > ATTACHMENT_MAX_BYTES) {
+    throw new JiraRequestError(
+      `Attachment ${attachment.filename} is ${arrayBuffer.byteLength} bytes, which exceeds the 50 MB inline limit.`,
+    );
+  }
+
+  return {
+    data: Buffer.from(arrayBuffer),
+    mimeType: resolveAttachmentMimeType(
+      response.headers.get("content-type") ?? attachment.mimeType,
+      attachment.filename,
+    ),
+  };
+}
+
+function formatDownloadAttachmentsText(result: DownloadAttachmentsResult): string {
+  const message = result.message ?? `Fetched ${result.downloaded} of ${result.total} attachments.`;
+  const attachmentNames =
+    result.attachments.length > 0
+      ? result.attachments.map((attachment) => attachment.filename).join(", ")
+      : "(none)";
+  const failedText =
+    result.failed.length > 0
+      ? result.failed.map((failure) => `${failure.filename}: ${failure.error}`).join("; ")
+      : "(none)";
+
+  return `${message}\nAttachments: ${attachmentNames}\nFailed: ${failedText}`;
+}
+
+function formatIssueImagesText(result: IssueImagesResult): string {
+  const message = result.message ?? `Fetched ${result.downloaded} of ${result.totalImages} image attachments.`;
+  const imageNames =
+    result.images.length > 0
+      ? result.images.map((image) => image.filename).join(", ")
+      : "(none)";
+  const failedText =
+    result.failed.length > 0
+      ? result.failed.map((failure) => `${failure.filename}: ${failure.error}`).join("; ")
+      : "(none)";
+
+  return `${message}\nImages: ${imageNames}\nFailed: ${failedText}`;
 }
 
 async function applyLabelUpdate(
@@ -285,6 +548,181 @@ export function createServer(): McpServer {
 
       return {
         content: [{ type: "text", text: formatToolText(result) }],
+        structuredContent: result,
+      };
+    },
+  );
+
+  server.registerTool(
+    "jira_download_attachments",
+    {
+      title: "Download Jira attachments",
+      description:
+        "Fetch all Jira issue attachments and return them as embedded MCP resources for agent inspection.",
+      inputSchema: attachmentInputSchema,
+      outputSchema: downloadAttachmentsOutputSchema,
+    },
+    async ({ issueKey }) => {
+      const config = getJiraConfig();
+      const attachments = await getIssueAttachments(config, issueKey);
+      const downloadedAttachments: AttachmentMetadata[] = [];
+      const failed: AttachmentFailure[] = [];
+      const content: Array<
+        | { type: "text"; text: string }
+        | {
+            type: "resource";
+            resource: {
+              uri: string;
+              mimeType: string;
+              blob: string;
+            };
+          }
+      > = [];
+
+      for (const attachment of attachments) {
+        if (attachment.size > ATTACHMENT_MAX_BYTES) {
+          failed.push({
+            filename: attachment.filename,
+            error:
+              `Attachment is ${attachment.size} bytes, which exceeds the 50 MB inline limit.`,
+          });
+          continue;
+        }
+
+        try {
+          const binary = await fetchAttachmentBinary(config, issueKey, attachment);
+          downloadedAttachments.push({
+            id: attachment.id,
+            filename: attachment.filename,
+            mimeType: binary.mimeType,
+            size: binary.data.length,
+          });
+          content.push({
+            type: "resource",
+            resource: {
+              uri: `attachment:///${issueKey}/${attachment.id}/${encodeURIComponent(attachment.filename)}`,
+              mimeType: binary.mimeType,
+              blob: binary.data.toString("base64"),
+            },
+          });
+        } catch (error: unknown) {
+          failed.push({
+            filename: attachment.filename,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const result: DownloadAttachmentsResult = {
+        issueKey,
+        total: attachments.length,
+        downloaded: downloadedAttachments.length,
+        attachments: downloadedAttachments,
+        failed,
+        ...(attachments.length === 0
+          ? { message: `No attachments found for ${issueKey}.` }
+          : {}),
+      };
+
+      return {
+        content: [{ type: "text", text: formatDownloadAttachmentsText(result) }, ...content],
+        structuredContent: result,
+      };
+    },
+  );
+
+  server.registerTool(
+    "jira_get_issue_images",
+    {
+      title: "Get Jira issue images",
+      description:
+        "Fetch image attachments from a Jira issue and return them as inline image content for vision-capable agents.",
+      inputSchema: attachmentInputSchema,
+      outputSchema: issueImagesOutputSchema,
+    },
+    async ({ issueKey }) => {
+      const config = getJiraConfig();
+      const attachments = await getIssueAttachments(config, issueKey);
+      const imageAttachments = attachments
+        .map((attachment) => ({
+          attachment,
+          resolvedMimeType: resolveImageMimeType(
+            attachment.mimeType,
+            attachment.filename,
+          ),
+        }))
+        .filter(
+          (
+            candidate,
+          ): candidate is {
+            attachment: JiraAttachment;
+            resolvedMimeType: string;
+          } => Boolean(candidate.resolvedMimeType),
+        );
+      const downloadedImages: AttachmentMetadata[] = [];
+      const failed: AttachmentFailure[] = [];
+      const imageContent: Array<{
+        type: "image";
+        data: string;
+        mimeType: string;
+      }> = [];
+
+      for (const { attachment, resolvedMimeType } of imageAttachments) {
+        if (attachment.size > ATTACHMENT_MAX_BYTES) {
+          failed.push({
+            filename: attachment.filename,
+            error:
+              `Image is ${attachment.size} bytes, which exceeds the 50 MB inline limit.`,
+          });
+          continue;
+        }
+
+        try {
+          const binary = await fetchAttachmentBinary(config, issueKey, attachment);
+          const fetchedImageMimeType = resolveImageMimeType(
+            binary.mimeType,
+            attachment.filename,
+          );
+          if (!fetchedImageMimeType) {
+            failed.push({
+              filename: attachment.filename,
+              error: `Downloaded content was not recognized as an image (reported MIME type: ${binary.mimeType}).`,
+            });
+            continue;
+          }
+
+          downloadedImages.push({
+            id: attachment.id,
+            filename: attachment.filename,
+            mimeType: fetchedImageMimeType,
+            size: binary.data.length,
+          });
+          imageContent.push({
+            type: "image",
+            data: binary.data.toString("base64"),
+            mimeType: fetchedImageMimeType,
+          });
+        } catch (error: unknown) {
+          failed.push({
+            filename: attachment.filename,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const result: IssueImagesResult = {
+        issueKey,
+        totalImages: imageAttachments.length,
+        downloaded: downloadedImages.length,
+        images: downloadedImages,
+        failed,
+        ...(imageAttachments.length === 0
+          ? { message: `No image attachments found for ${issueKey}.` }
+          : {}),
+      };
+
+      return {
+        content: [{ type: "text", text: formatIssueImagesText(result) }, ...imageContent],
         structuredContent: result,
       };
     },
